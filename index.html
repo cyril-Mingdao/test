@@ -1676,6 +1676,8 @@
       // ==========================================
       // 【修改區塊】支援外部台語 TTS 模型的發音功能
       // 採用意傳科技「鬥拍字／媠聲」開源台語語音合成服務 (suisiann.ithuan.tw)
+      // 主要端點（與官方 demo-ui 套件一致，單一 GET、免斷詞、不受 CORS 限制）：
+      //   GET https://hts.ithuan.tw/文本直接合成?查詢腔口=閩南語&查詢語句=<台語漢字>
       // ==========================================
       async function speakText(t, l) {
         if (!synth) return;
@@ -1685,18 +1687,21 @@
         if (l === "nan-TW") {
           showToast("正在生成道地台語語音...", "normal");
 
-          // 意傳科技 鬥拍字／媠聲 API 網域
-          const ithuanDomain = "https://hokbu.ithuan.tw/";
+          const taibun = t.trim();
 
-          // 依「查詢腔口＝閩南語」組裝語音合成音檔網址
-          const buildSynthUrl = (sentence) =>
-            ithuanDomain +
-            "語音合成?" +
+          // 主要：意傳「文本直接合成」端點——直接吃台語漢字，免事先斷詞
+          const htsUrl =
+            "https://hts.ithuan.tw/文本直接合成?" +
             "查詢腔口=" + encodeURIComponent("閩南語") +
-            "&查詢語句=" + encodeURIComponent(sentence);
+            "&查詢語句=" + encodeURIComponent(taibun);
 
-          // 以 <audio> 載入並播放音檔（屬媒體請求，不受 CORS 限制，連 file:// 也可用）
-          // 成功開始播放→resolve；載入錯誤或被瀏覽器阻擋→reject
+          // 後備：意傳「媠聲」端點（吃漢字／台羅皆可）
+          const hapsingUrl =
+            "https://hapsing.ithuan.tw/bangtsam?taibun=" +
+            encodeURIComponent(taibun);
+
+          // 以 <audio> 載入並播放音檔（屬媒體請求，跨網域仍可播放）
+          // 成功開始播放 → resolve；載入錯誤或被瀏覽器阻擋 → reject
           const playAudioUrl = (url) =>
             new Promise((resolve, reject) => {
               const audio = new Audio();
@@ -1714,43 +1719,23 @@
             });
 
           try {
-            // ── 主要流程（伺服器環境）──
-            // 第一步：呼叫「標漢字音標」(tau)，將台語漢字轉成分詞。此步驟需 fetch 跨網域，
-            //         僅在以 http(s) 開啟的網頁可用；以 file:// 直接開檔會被瀏覽器擋下。
-            const tauForm = new URLSearchParams();
-            tauForm.append("taibun", t.trim());
-
-            const tauRes = await fetch(ithuanDomain + "tau", {
-              method: "POST",
-              headers: { "Content-Type": "application/x-www-form-urlencoded" },
-              body: tauForm.toString(),
-            });
-            if (!tauRes.ok) throw new Error("斷詞服務回應 HTTP " + tauRes.status);
-
-            const tauData = await tauRes.json();
-            const hunsu = tauData && tauData.分詞 ? tauData.分詞 : "";
-            if (!hunsu) throw new Error("無法取得台語分詞結果");
-
-            // 第二步：依分詞合成並播放
-            await playAudioUrl(buildSynthUrl(hunsu));
+            // 先試官方文本直接合成端點
+            await playAudioUrl(htsUrl);
             return; // 成功，結束函式（不退回系統語音）
           } catch (error) {
-            console.error("台語 TTS（標準流程）失敗:", error);
-
-            // ── 後備流程（本機 file:// 亦可運作）──
-            // 跳過需要 fetch 的斷詞步驟，直接用漢字呼叫語音合成。
-            // 這是純媒體請求，不受 CORS 限制，能在直接雙擊開檔的情況下運作。
+            console.error("台語 TTS（hts 端點）失敗，改試 hapsing：", error);
             try {
-              await playAudioUrl(buildSynthUrl(t.trim()));
-              return; // 後備成功，結束函式
+              // 後備端點
+              await playAudioUrl(hapsingUrl);
+              return;
             } catch (error2) {
-              console.error("台語 TTS（後備流程）失敗:", error2);
+              console.error("台語 TTS（hapsing 端點）亦失敗：", error2);
               const hint =
                 location.protocol === "file:"
-                  ? "請勿直接雙擊開啟此檔，改用網頁伺服器開啟（例如 VS Code 的 Live Server，或在檔案資料夾執行 python -m http.server），台語語音才能正常運作。"
-                  : "台語語音服務暫時無法連線，請確認網路後再試。";
+                  ? "請勿直接雙擊開啟此檔，改用網頁伺服器開啟（例如 VS Code Live Server，或執行 python -m http.server）。"
+                  : "可能是台語語音服務暫時無法連線，或一分鐘內合成次數過多（服務限制 1 IP 每分鐘最多 3 句），請稍候再試。";
               showToast("台語語音生成失敗。" + hint, "error");
-              return; // 不退回系統內建語音，避免誤唸成華語
+              return; // 不退回系統內建語音，避免把台語誤唸成華語
             }
           }
         }
