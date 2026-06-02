@@ -1676,8 +1676,11 @@
       // ==========================================
       // 【修改區塊】支援外部台語 TTS 模型的發音功能
       // 採用意傳科技「鬥拍字／媠聲」開源台語語音合成服務 (suisiann.ithuan.tw)
-      // 主要端點（與官方 demo-ui 套件一致，單一 GET、免斷詞、不受 CORS 限制）：
-      //   GET https://hts.ithuan.tw/文本直接合成?查詢腔口=閩南語&查詢語句=<台語漢字>
+      // 與線上版鬥拍字相同的兩步驟流程：
+      //   第一步 斷詞標音：POST https://hokbu.ithuan.tw/tau (參數 taibun=台語漢字)
+      //                   → 回傳 { kiatko: [ { 漢字, KIP, 分詞 }, ... ] }
+      //   第二步 語音合成：GET  https://hapsing.ithuan.tw/bangtsam?taibun=<台羅KIP>
+      //   ⚠ 重點：hapsing 端點吃的是「台羅 KIP 拼音」，不是漢字！
       // ==========================================
       async function speakText(t, l) {
         if (!synth) return;
@@ -1689,54 +1692,85 @@
 
           const taibun = t.trim();
 
-          // 主要：意傳「文本直接合成」端點——直接吃台語漢字，免事先斷詞
-          const htsUrl =
-            "https://hts.ithuan.tw/文本直接合成?" +
-            "查詢腔口=" + encodeURIComponent("閩南語") +
-            "&查詢語句=" + encodeURIComponent(taibun);
-
-          // 後備：意傳「媠聲」端點（吃漢字／台羅皆可）
-          const hapsingUrl =
-            "https://hapsing.ithuan.tw/bangtsam?taibun=" +
-            encodeURIComponent(taibun);
-
-          // 以 <audio> 載入並播放音檔（屬媒體請求，跨網域仍可播放）
-          // 成功開始播放 → resolve；載入錯誤或被瀏覽器阻擋 → reject
-          const playAudioUrl = (url) =>
-            new Promise((resolve, reject) => {
-              const audio = new Audio();
-              let settled = false;
-              const done = (ok, err) => {
-                if (settled) return;
-                settled = true;
-                ok ? resolve() : reject(err || new Error("音檔載入失敗"));
-              };
-              audio.addEventListener("playing", () => done(true));
-              audio.addEventListener("error", () => done(false));
-              audio.src = url;
+          // 用 fetch 取得音檔（blob），可同時拿到真實 HTTP 狀態，便於診斷；
+          // 取得後以 blob URL 播放。
+          const playKip = async (kip) => {
+            const url =
+              "https://hapsing.ithuan.tw/bangtsam?taibun=" +
+              encodeURIComponent(kip);
+            const res = await fetch(url);
+            if (!res.ok) {
+              throw new Error("合成端點回應 HTTP " + res.status + "（" + kip + "）");
+            }
+            const ct = res.headers.get("content-type") || "";
+            const blob = await res.blob();
+            // 若回傳的不是音檔（例如錯誤頁、限流訊息），視為失敗
+            if (!ct.startsWith("audio") && blob.type && !blob.type.startsWith("audio")) {
+              throw new Error("合成端點未回傳音檔（content-type: " + (ct || blob.type) + "）");
+            }
+            const objUrl = URL.createObjectURL(blob);
+            await new Promise((resolve, reject) => {
+              const audio = new Audio(objUrl);
+              audio.addEventListener("ended", resolve);
+              audio.addEventListener("error", () =>
+                reject(new Error("音檔無法播放"))
+              );
               const p = audio.play();
-              if (p && p.catch) p.catch((e) => done(false, e));
-            });
+              if (p && p.catch) p.catch(reject);
+            }).finally(() => URL.revokeObjectURL(objUrl));
+          };
 
           try {
-            // 先試官方文本直接合成端點
-            await playAudioUrl(htsUrl);
+            // 第一步：斷詞標音，取得每段的台羅 KIP 拼音
+            const tauForm = new URLSearchParams();
+            tauForm.append("taibun", taibun);
+
+            const tauRes = await fetch("https://hokbu.ithuan.tw/tau", {
+              method: "POST",
+              headers: { "Content-Type": "application/x-www-form-urlencoded" },
+              body: tauForm.toString(),
+            });
+            if (!tauRes.ok) {
+              throw new Error("斷詞端點回應 HTTP " + tauRes.status);
+            }
+
+            const tauData = await tauRes.json();
+            const kiatko = (tauData && tauData.kiatko) || [];
+            const kipList = kiatko
+              .map((x) => x && x.KIP)
+              .filter((kip) => kip && kip.trim());
+
+            if (kipList.length === 0) {
+              throw new Error("斷詞結果沒有可用的台羅拼音");
+            }
+
+            // 第二步：逐段合成並依序播放
+            for (const kip of kipList) {
+              await playKip(kip);
+            }
             return; // 成功，結束函式（不退回系統語音）
           } catch (error) {
-            console.error("台語 TTS（hts 端點）失敗，改試 hapsing：", error);
-            try {
-              // 後備端點
-              await playAudioUrl(hapsingUrl);
-              return;
-            } catch (error2) {
-              console.error("台語 TTS（hapsing 端點）亦失敗：", error2);
-              const hint =
-                location.protocol === "file:"
-                  ? "請勿直接雙擊開啟此檔，改用網頁伺服器開啟（例如 VS Code Live Server，或執行 python -m http.server）。"
-                  : "可能是台語語音服務暫時無法連線，或一分鐘內合成次數過多（服務限制 1 IP 每分鐘最多 3 句），請稍候再試。";
-              showToast("台語語音生成失敗。" + hint, "error");
-              return; // 不退回系統內建語音，避免把台語誤唸成華語
+            console.error("台語 TTS 失敗：", error);
+
+            // 將真實錯誤訊息一併顯示，方便判斷問題
+            let hint;
+            const msg = (error && error.message) || String(error);
+            if (error && error.name === "TypeError") {
+              // fetch 直接拋 TypeError 多半是 CORS 或網路被擋
+              hint =
+                "瀏覽器擋下了對意傳伺服器的請求（可能是 CORS 跨網域限制）。" +
+                "若你的網站是 https，這通常需要透過後端代理轉發意傳 API 才能解決。";
+            } else if (location.protocol === "file:") {
+              hint =
+                "請勿直接雙擊開啟此檔，改用網頁伺服器開啟（例如 VS Code Live Server，或執行 python -m http.server）。";
+            } else if (/HTTP (429|503)/.test(msg)) {
+              hint =
+                "已達服務流量限制（1 IP 每分鐘最多 3 句），請稍候再試。";
+            } else {
+              hint = "請稍候再試，或開啟瀏覽器 F12 主控台查看詳細錯誤。";
             }
+            showToast("台語語音生成失敗：" + msg + "。" + hint, "error");
+            return; // 不退回系統內建語音，避免把台語誤唸成華語
           }
         }
 
