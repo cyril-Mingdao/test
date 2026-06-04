@@ -1682,22 +1682,39 @@
         if (!synth) return;
 
         // 1. 攔截台語 (nan-TW)，改用「鬥拍字」意傳科技台語 TTS 服務
+        //    後端：https://hokbu.ithuan.tw/
+        //    流程分兩步：
+        //      (1) 標漢字音標 POST /tau  → 取得「分詞」
+        //      (2) 語音合成   GET  /語音合成?查詢腔口=閩南語&查詢語句={分詞} → 回傳音檔
         if (l === "nan-TW") {
           showToast("正在生成道地台語語音...", "normal");
           try {
-            // 鬥拍字 TTS API：傳入漢字，直接回傳音檔
-            // API 格式：GET https://tts-iok-tsih.suisiann.ithuan.tw/{漢字}
-            const encodedText = encodeURIComponent(t);
-            const ttsApiUrl = `https://tts-iok-tsih.suisiann.ithuan.tw/${encodedText}`;
+            const 網域 = "https://hokbu.ithuan.tw/";
 
-            const audio = new Audio(ttsApiUrl);
-            
-            // 等待音檔載入，確保可以播放
+            // === 步驟 1：標漢字音標，取得分詞 ===
+            const tauResp = await fetch(`${網域}tau`, {
+              method: "POST",
+              headers: { "Content-Type": "application/x-www-form-urlencoded" },
+              body: "taibun=" + encodeURIComponent(t.trim()),
+            });
+            if (!tauResp.ok) throw new Error("標音服務無回應 (" + tauResp.status + ")");
+
+            const tauData = await tauResp.json();
+            const 分詞 = tauData.分詞;
+            if (!分詞) throw new Error("標音結果無分詞資料");
+
+            // === 步驟 2：語音合成，取得音檔網址 ===
+            const 腔口 = "閩南語";
+            const ttsUrl = encodeURI(
+              `${網域}語音合成?查詢腔口=${腔口}&查詢語句=${分詞}`
+            );
+
+            const audio = new Audio(ttsUrl);
             await new Promise((resolve, reject) => {
+              audio.oncanplaythrough = resolve;
               audio.oncanplay = resolve;
               audio.onerror = () => reject(new Error("鬥拍字音檔載入失敗"));
-              // 設定逾時，避免等待過久
-              setTimeout(() => reject(new Error("鬥拍字回應逾時")), 10000);
+              setTimeout(() => reject(new Error("鬥拍字回應逾時")), 15000);
             });
 
             audio.play();
