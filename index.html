@@ -1675,73 +1675,39 @@
 
       // ==========================================
       // 【修改區塊】支援外部台語 TTS 模型的發音功能
-      // 採用意傳科技「鬥拍字／媠聲」開源台語語音合成服務 (suisiann.ithuan.tw)
-      //
-      // ⚠ 重要：意傳 API 不允許跨網域 fetch（CORS 會擋），所以「不能」用 fetch 呼叫。
-      //    解法：改用 <audio> 標籤直接播放音檔 URL —— 媒體播放不受 CORS 限制。
-      //    使用「文本直接合成」GET 端點：直接吃台語漢字、回傳音檔，無需事先斷詞。
-      //    GET https://hts.ithuan.tw/文本直接合成?查詢腔口=閩南語&查詢語句=<台語漢字>
+      // 使用意傳科技「鬥拍字」(TauPhahJi-BangTsam) 開源台語語音合成服務
+      // 來源：https://github.com/i3thuan5/TauPhahJi-BangTsam
       // ==========================================
       async function speakText(t, l) {
         if (!synth) return;
 
-        // 1. 攔截台語 (nan-TW)，改用意傳科技「鬥拍字／媠聲」開源台語語音合成服務
-        //    服務網址：https://suisiann.ithuan.tw/ ，MIT 授權、免 API Key、專為台語設計
+        // 1. 攔截台語 (nan-TW)，改用「鬥拍字」意傳科技台語 TTS 服務
         if (l === "nan-TW") {
           showToast("正在生成道地台語語音...", "normal");
+          try {
+            // 鬥拍字 TTS API：傳入漢字，直接回傳音檔
+            // API 格式：GET https://tts-iok-tsih.suisiann.ithuan.tw/{漢字}
+            const encodedText = encodeURIComponent(t);
+            const ttsApiUrl = `https://tts-iok-tsih.suisiann.ithuan.tw/${encodedText}`;
 
-          const taibun = t.trim();
-
-          // 依序嘗試的音檔 URL（皆為 GET、可直接吃漢字，用 <audio> 播放即可，免 fetch、免 CORS）
-          // 用 encodeURI 包整個網址（含中文路徑與參數名），與意傳官方前端一致。
-          const candidateUrls = [
-            encodeURI(
-              "https://hts.ithuan.tw/文本直接合成?查詢腔口=閩南語&查詢語句=" + taibun
-            ),
-            encodeURI(
-              "https://hokbu.ithuan.tw/文本直接合成?查詢腔口=閩南語&查詢語句=" + taibun
-            ),
-          ];
-
-          // 用單一 <audio> 元素直接播放某個 URL（不經 fetch，故不受 CORS 限制）
-          // 成功開始播放→resolve(true)；載入失敗→resolve(false)，由呼叫端決定是否換下一個
-          const tryPlay = (url) =>
-            new Promise((resolve) => {
-              const audio = new Audio();
-              let settled = false;
-              const finish = (ok) => {
-                if (settled) return;
-                settled = true;
-                resolve(ok);
-              };
-              audio.addEventListener("playing", () => finish(true));
-              audio.addEventListener("error", () => finish(false));
-              // 逾時保護：15 秒內若仍無法播放，視為失敗
-              setTimeout(() => finish(false), 15000);
-              audio.src = url;
-              const p = audio.play();
-              if (p && p.catch) p.catch(() => finish(false));
+            const audio = new Audio(ttsApiUrl);
+            
+            // 等待音檔載入，確保可以播放
+            await new Promise((resolve, reject) => {
+              audio.oncanplay = resolve;
+              audio.onerror = () => reject(new Error("鬥拍字音檔載入失敗"));
+              // 設定逾時，避免等待過久
+              setTimeout(() => reject(new Error("鬥拍字回應逾時")), 10000);
             });
 
-          // 逐一嘗試候選端點，任一成功即結束
-          for (const url of candidateUrls) {
-            try {
-              const ok = await tryPlay(url);
-              if (ok) return; // 成功播放，結束（不退回系統語音）
-            } catch (e) {
-              console.error("台語 TTS 端點失敗：", url, e);
-            }
-          }
+            audio.play();
+            return; // 成功播放後，結束函式，不執行下方系統 TTS
 
-          // 全部失敗：提供明確指引
-          console.error("台語 TTS：所有端點皆無法播放。已嘗試：", candidateUrls);
-          showToast(
-            "台語語音生成失敗。請先在瀏覽器分頁直接開啟測試網址確認服務是否正常；" +
-              "若服務正常但此處仍無法播放，多半是意傳 API 的跨網域（CORS）限制，" +
-              "需要在你的主機架設後端代理轉發。詳見下方說明。",
-            "error"
-          );
-          return; // 不退回系統內建語音，避免把台語誤唸成華語
+          } catch (error) {
+            console.error("台語 TTS 錯誤:", error);
+            showToast("鬥拍字服務無回應，退回系統內建語音", "error");
+            // 若失敗，防呆機制會自動往下走，使用系統內建發音
+          }
         }
 
         // 2. 原有的系統內建 TTS (Web Speech API) - 供其他語言或台語失敗時備用
