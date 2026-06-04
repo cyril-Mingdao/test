@@ -917,7 +917,7 @@
     <script>
       let userApiKey = "";
       let userBaseUrl = "https://generativelanguage.googleapis.com";
-      let selectedModel = "";
+      let selectedModel = "gemini-3-flash-preview";
       const languages = [
         {
           name: "繁體中文",
@@ -1057,9 +1057,18 @@
             return;
           }
           select.innerHTML = "";
+          // 優先排序：把偏好的預設模型排到最前面
+          const 偏好模型 = "gemini-3-flash-preview";
           availableModels.sort((a, b) => {
-            if (a.includes("1.5-flash") && !b.includes("1.5-flash")) return -1;
-            if (!a.includes("1.5-flash") && b.includes("1.5-flash")) return 1;
+            const aMatch = a === 偏好模型;
+            const bMatch = b === 偏好模型;
+            if (aMatch && !bMatch) return -1;
+            if (!aMatch && bMatch) return 1;
+            // 次優先：其他 flash-preview，再來才是 flash
+            const aPrev = a.includes("flash-preview");
+            const bPrev = b.includes("flash-preview");
+            if (aPrev && !bPrev) return -1;
+            if (!aPrev && bPrev) return 1;
             return 0;
           });
           availableModels.forEach((model) => {
@@ -1074,8 +1083,8 @@
           showToast(`已選擇: ${selectedModel}`);
         } catch (e) {
           select.innerHTML =
-            '<option value="gemini-1.5-flash">預設(1.5 Flash)</option>';
-          selectedModel = "gemini-1.5-flash";
+            '<option value="gemini-3-flash-preview">預設(3 Flash Preview)</option>';
+          selectedModel = "gemini-3-flash-preview";
         }
       }
       function manualSelectModel() {
@@ -1448,11 +1457,12 @@
           throw new Error("No Key");
         }
         const fallbackModels = [
+          "gemini-3-flash-preview",
           "gemini-1.5-flash",
           "gemini-1.5-flash-8b",
           "gemini-1.0-pro",
         ];
-        let attemptList = [selectedModel || "gemini-1.5-flash"];
+        let attemptList = [selectedModel || "gemini-3-flash-preview"];
         fallbackModels.forEach((m) => {
           if (!attemptList.includes(m)) attemptList.push(m);
         });
@@ -1503,7 +1513,7 @@
         const prompt = `Identify the language of the following text. Choose ONLY ONE from this list: [${langNames}]. Output only the language name. Text: "${text}"`;
         try {
           const res = await fetch(
-            `${userBaseUrl}/v1beta/models/${selectedModel || "gemini-1.5-flash"}:generateContent?key=${userApiKey}`,
+            `${userBaseUrl}/v1beta/models/${selectedModel || "gemini-3-flash-preview"}:generateContent?key=${userApiKey}`,
             {
               method: "POST",
               headers: { "Content-Type": "application/json" },
@@ -1678,32 +1688,74 @@
       // 使用意傳科技「鬥拍字」(TauPhahJi-BangTsam) 開源台語語音合成服務
       // 來源：https://github.com/i3thuan5/TauPhahJi-BangTsam
       // ==========================================
+
+      // 呼叫鬥拍字標音 API (POST /tau)，回傳「分詞」字串。
+      // 因 hokbu.ithuan.tw 未開放 CORS，這裡依序嘗試多個公開 CORS 代理轉送。
+      // 若全部失效：可自行架設代理（最穩定），或更新下方代理清單。
+      async function 標漢字音標(網域, 漢字) {
+        const target = `${網域}tau`;
+        const body = "taibun=" + encodeURIComponent(漢字);
+
+        // 代理清單：{ build: 產生代理後的網址, wrapped: 回應是否被 JSON 包一層 }
+        const 代理清單 = [
+          // 1) 先試直連（同源部署、或對方日後開放 CORS 時可用）
+          { build: (u) => u, wrapped: false },
+          // 2) corsproxy.io
+          { build: (u) => "https://corsproxy.io/?url=" + encodeURIComponent(u), wrapped: false },
+          // 3) allorigins（會把回應包在 { contents } 內）
+          { build: (u) => "https://api.allorigins.win/get?url=" + encodeURIComponent(u), wrapped: true },
+        ];
+
+        let lastError = null;
+        for (const 代理 of 代理清單) {
+          try {
+            const resp = await fetch(代理.build(target), {
+              method: "POST",
+              headers: { "Content-Type": "application/x-www-form-urlencoded" },
+              body,
+            });
+            if (!resp.ok) {
+              lastError = new Error("標音服務回應 " + resp.status);
+              continue;
+            }
+            let data;
+            if (代理.wrapped) {
+              const outer = await resp.json();
+              data = JSON.parse(outer.contents);
+            } else {
+              data = await resp.json();
+            }
+            if (data && data.分詞) return data.分詞;
+            lastError = new Error("標音結果無分詞資料");
+          } catch (e) {
+            lastError = e;
+          }
+        }
+        throw lastError || new Error("標音失敗");
+      }
+
       async function speakText(t, l) {
         if (!synth) return;
 
         // 1. 攔截台語 (nan-TW)，改用「鬥拍字」意傳科技台語 TTS 服務
         //    後端：https://hokbu.ithuan.tw/
         //    流程分兩步：
-        //      (1) 標漢字音標 POST /tau  → 取得「分詞」
-        //      (2) 語音合成   GET  /語音合成?查詢腔口=閩南語&查詢語句={分詞} → 回傳音檔
+        //      (1) 標漢字音標 POST /tau  → 取得「分詞」（受 CORS 限制，需經代理）
+        //      (2) 語音合成   GET  /語音合成?... → 回傳音檔（音訊播放不受 CORS 限制，可直連）
         if (l === "nan-TW") {
           showToast("正在生成道地台語語音...", "normal");
           try {
             const 網域 = "https://hokbu.ithuan.tw/";
 
             // === 步驟 1：標漢字音標，取得分詞 ===
-            const tauResp = await fetch(`${網域}tau`, {
-              method: "POST",
-              headers: { "Content-Type": "application/x-www-form-urlencoded" },
-              body: "taibun=" + encodeURIComponent(t.trim()),
-            });
-            if (!tauResp.ok) throw new Error("標音服務無回應 (" + tauResp.status + ")");
-
-            const tauData = await tauResp.json();
-            const 分詞 = tauData.分詞;
+            // hokbu.ithuan.tw 沒有開放 CORS，從其他網域（如 GitHub Pages）
+            // 必須透過 CORS 代理轉送這個 POST 請求。
+            // 下面依序嘗試多個公開代理，任一成功即可；
+            // 若全部失效，可自行架設代理或替換清單。
+            const 分詞 = await 標漢字音標(網域, t.trim());
             if (!分詞) throw new Error("標音結果無分詞資料");
 
-            // === 步驟 2：語音合成，取得音檔網址 ===
+            // === 步驟 2：語音合成（GET 音檔，可直連，不需代理）===
             const 腔口 = "閩南語";
             const ttsUrl = encodeURI(
               `${網域}語音合成?查詢腔口=${腔口}&查詢語句=${分詞}`
