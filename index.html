@@ -762,6 +762,7 @@
       </div>
     </div>
     <div id="toast-container"></div>
+    <audio id="ithuanAudioPlayer" style="display: none"></audio>
 
     <div id="textModeContainer">
       <div class="text-card">
@@ -917,7 +918,69 @@
     <script>
       let userApiKey = "";
       let userBaseUrl = "https://generativelanguage.googleapis.com";
-      let selectedModel = "gemini-3-flash-preview";
+      let selectedModel = "";
+
+      // ================= 意傳「媠聲」台語語音合成 =================
+      // 免費展示服務，輸入臺羅調符式(KIP)、回傳 MP3。官方限流 1 IP 每分鐘最多 3 句，
+      // 正式量產前請洽意傳科技(ithuan.tw)，教材/公開使用請標示語音來源。
+      const ITHUAN_TTS_URL = "https://hapsing.ithuan.tw/bangtsam";
+      const ITHUAN_MIN_INTERVAL_MS = 21000;
+      let lastIthuanRequestTime = 0;
+
+      async function textToTaiiloKip(text) {
+        const prompt = `Convert the following Taiwanese Hokkien (Tai-gi) text into pure Tai-lo (KIP) romanization with tone diacritics. Output ONLY the romanized text, separated by spaces, no Chinese characters, no explanation, no punctuation other than what marks tone. Text: "${text}"`;
+        const res = await fetch(
+          `${userBaseUrl}/v1beta/models/${selectedModel || "gemini-1.5-flash"}:generateContent?key=${userApiKey}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              contents: [{ parts: [{ text: prompt }] }],
+            }),
+          },
+        );
+        if (!res.ok) throw new Error("臺羅拼音轉換失敗");
+        const data = await res.json();
+        if (!data.candidates) throw new Error("臺羅拼音轉換失敗");
+        return data.candidates[0].content.parts[0].text.trim();
+      }
+
+      async function speakIthuan(text) {
+        if (!userApiKey) {
+          showToast("請先設定 API Key 才能使用台語語音", "error");
+          return false;
+        }
+        const waitMs = ITHUAN_MIN_INTERVAL_MS - (Date.now() - lastIthuanRequestTime);
+        if (waitMs > 0) {
+          showToast(
+            `意傳媠聲限流中(免費服務每分鐘限3句)，請 ${Math.ceil(waitMs / 1000)} 秒後再試`,
+            "error",
+          );
+          return false;
+        }
+        try {
+          showToast("正在合成台語語音…");
+          const kip = await textToTaiiloKip(text);
+          lastIthuanRequestTime = Date.now();
+          const url = `${ITHUAN_TTS_URL}?taibun=${encodeURIComponent(kip)}`;
+          const player = document.getElementById("ithuanAudioPlayer");
+          player.src = url;
+          await player.play();
+          return true;
+        } catch (e) {
+          showToast("台語語音合成失敗: " + e.message, "error");
+          return false;
+        }
+      }
+
+      // 依語言代碼分派：臺灣台語走意傳媠聲，其餘語言走瀏覽器內建語音
+      async function smartSpeak(text, langCode) {
+        if (langCode === "nan-TW") {
+          await speakIthuan(text);
+        } else {
+          speakText(text, langCode);
+        }
+      }
       const languages = [
         {
           name: "繁體中文",
@@ -925,10 +988,10 @@
           speechCode: "zh-TW",
         },
         {
-          name: "臺灣台語",
-          prompt: "Taiwanese Hokkien",
+          name: "臺灣台語 (Tâi-gí)",
+          prompt:
+            "Taiwanese Hokkien (Tâi-gí), written in the mixed script style used by Taiwan's Ministry of Education — Traditional Chinese characters combined with Tâi-lô (KIP) romanization for words without a common character form",
           speechCode: "nan-TW",
-          bronciLang: "台語",
         },
         { name: "English (英語)", prompt: "English", speechCode: "en-US" },
         { name: "日本語 (日語)", prompt: "Japanese", speechCode: "ja-JP" },
@@ -1057,18 +1120,9 @@
             return;
           }
           select.innerHTML = "";
-          // 優先排序：把偏好的預設模型排到最前面
-          const 偏好模型 = "gemini-3-flash-preview";
           availableModels.sort((a, b) => {
-            const aMatch = a === 偏好模型;
-            const bMatch = b === 偏好模型;
-            if (aMatch && !bMatch) return -1;
-            if (!aMatch && bMatch) return 1;
-            // 次優先：其他 flash-preview，再來才是 flash
-            const aPrev = a.includes("flash-preview");
-            const bPrev = b.includes("flash-preview");
-            if (aPrev && !bPrev) return -1;
-            if (!aPrev && bPrev) return 1;
+            if (a.includes("1.5-flash") && !b.includes("1.5-flash")) return -1;
+            if (!a.includes("1.5-flash") && b.includes("1.5-flash")) return 1;
             return 0;
           });
           availableModels.forEach((model) => {
@@ -1083,8 +1137,8 @@
           showToast(`已選擇: ${selectedModel}`);
         } catch (e) {
           select.innerHTML =
-            '<option value="gemini-3-flash-preview">預設(3 Flash Preview)</option>';
-          selectedModel = "gemini-3-flash-preview";
+            '<option value="gemini-1.5-flash">預設(1.5 Flash)</option>';
+          selectedModel = "gemini-1.5-flash";
         }
       }
       function manualSelectModel() {
@@ -1141,7 +1195,7 @@
             if (text && text !== "...") {
               const langIndex = item.getLangIdx();
               const langCode = languages[langIndex].speechCode;
-              speakText(text, langCode);
+              smartSpeak(text, langCode);
             }
           });
         });
@@ -1335,6 +1389,10 @@
         let dragThreshold = 10;
         let isPressing = false;
 
+        /* === iOS 專用修復 === */
+        /* iOS Safari 中 touchstart (passive:false) + touch-action:none 會導致 */
+        /* 瀏覽器無法將觸控視為有效的使用者手勢，因而阻擋麥克風權限請求。 */
+        /* 改用 click 事件（iOS 會在 tap 後合成 click）來啟動語音辨識。 */
         if (isIOS) {
           let iosTouchMoved = false;
           btn.addEventListener("touchstart", function (e) {
@@ -1385,14 +1443,16 @@
             }
           });
 
+          /* iOS 上以 click 啟動語音辨識，確保瀏覽器認定為使用者手勢 */
           btn.addEventListener("click", function (e) {
             e.preventDefault();
             if (iosTouchMoved) { iosTouchMoved = false; return; }
             startListening(side);
           });
 
-          return;
+          return; /* iOS 路徑結束，不執行下方非 iOS 邏輯 */
         }
+        /* === iOS 修復結束 === */
 
         const handleStart = (e) => {
           if (synth) {
@@ -1457,12 +1517,11 @@
           throw new Error("No Key");
         }
         const fallbackModels = [
-          "gemini-3-flash-preview",
           "gemini-1.5-flash",
           "gemini-1.5-flash-8b",
           "gemini-1.0-pro",
         ];
-        let attemptList = [selectedModel || "gemini-3-flash-preview"];
+        let attemptList = [selectedModel || "gemini-1.5-flash"];
         fallbackModels.forEach((m) => {
           if (!attemptList.includes(m)) attemptList.push(m);
         });
@@ -1513,7 +1572,7 @@
         const prompt = `Identify the language of the following text. Choose ONLY ONE from this list: [${langNames}]. Output only the language name. Text: "${text}"`;
         try {
           const res = await fetch(
-            `${userBaseUrl}/v1beta/models/${selectedModel || "gemini-3-flash-preview"}:generateContent?key=${userApiKey}`,
+            `${userBaseUrl}/v1beta/models/${selectedModel || "gemini-1.5-flash"}:generateContent?key=${userApiKey}`,
             {
               method: "POST",
               headers: { "Content-Type": "application/json" },
@@ -1585,15 +1644,14 @@
           o.value = "";
         }
       }
-
       function playTextTranslation() {
         const text = document.getElementById("textOutput").value;
         const targetLangIdx = document.getElementById("textTargetLang").value;
-        if (text) speakText(text, languages[targetLangIdx].speechCode);
+        if (text) smartSpeak(text, languages[targetLangIdx].speechCode);
         else showToast("沒有可播放的文字");
       }
 
-      function downloadTextAudio() {
+      async function downloadTextAudio() {
         const text = document.getElementById("textOutput").value;
         const targetLangIdx = document.getElementById("textTargetLang").value;
         let langCode = languages[targetLangIdx].speechCode;
@@ -1602,7 +1660,39 @@
           return;
         }
         if (text.length > 200) {
-          showToast("文字過長，Google TTS 無法下載 (限200字)", "error");
+          showToast("文字過長，無法下載 (限200字)", "error");
+          return;
+        }
+        if (langCode === "nan-TW") {
+          if (!userApiKey) {
+            showToast("請先設定 API Key 才能下載台語語音", "error");
+            return;
+          }
+          const waitMs =
+            ITHUAN_MIN_INTERVAL_MS - (Date.now() - lastIthuanRequestTime);
+          if (waitMs > 0) {
+            showToast(
+              `意傳媠聲限流中(免費服務每分鐘限3句)，請 ${Math.ceil(waitMs / 1000)} 秒後再試`,
+              "error",
+            );
+            return;
+          }
+          try {
+            showToast("正在合成台語語音…");
+            const kip = await textToTaiiloKip(text);
+            lastIthuanRequestTime = Date.now();
+            const url = `${ITHUAN_TTS_URL}?taibun=${encodeURIComponent(kip)}`;
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = "translation_taigi.mp3";
+            a.target = "_blank";
+            a.rel = "noreferrer";
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+          } catch (e) {
+            showToast("台語語音合成失敗: " + e.message, "error");
+          }
           return;
         }
         if (langCode !== "zh-TW") langCode = langCode.split("-")[0];
@@ -1647,13 +1737,11 @@
           }
         }
       }
-
       function stopListening() {
         if (recognition) recognition.stop();
         isListening = false;
         updateMicUI(false);
       }
-
       function updateMicUI(l) {
         document
           .getElementById("topMicBtn")
@@ -1662,7 +1750,6 @@
           .getElementById("bottomMicBtn")
           .classList.toggle("listening", l && activeMicSide === "bottom");
       }
-
       async function doVoiceTranslation(text, side) {
         const topIdx = document.getElementById("voiceTopLang").value;
         const bottomIdx = document.getElementById("voiceBottomLang").value;
@@ -1680,106 +1767,11 @@
         }
         const r = await callGeminiAPI(text, sP, tP);
         document.getElementById(out).innerText = r;
-        if (!r.startsWith("[")) speakText(r, speechLang);
+        if (!r.startsWith("[")) smartSpeak(r, speechLang);
       }
 
-      // ==========================================
-      // 【修改區塊】支援外部台語 TTS 模型的發音功能
-      // 使用意傳科技「鬥拍字」(TauPhahJi-BangTsam) 開源台語語音合成服務
-      // 來源：https://github.com/i3thuan5/TauPhahJi-BangTsam
-      // ==========================================
-
-      // 呼叫鬥拍字標音 API (POST /tau)，回傳「分詞」字串。
-      // 因 hokbu.ithuan.tw 未開放 CORS，這裡依序嘗試多個公開 CORS 代理轉送。
-      // 若全部失效：可自行架設代理（最穩定），或更新下方代理清單。
-      async function 標漢字音標(網域, 漢字) {
-        const target = `${網域}tau`;
-        const body = "taibun=" + encodeURIComponent(漢字);
-
-        // 代理清單：{ build: 產生代理後的網址, wrapped: 回應是否被 JSON 包一層 }
-        const 代理清單 = [
-          // 1) 先試直連（同源部署、或對方日後開放 CORS 時可用）
-          { build: (u) => u, wrapped: false },
-          // 2) corsproxy.io
-          { build: (u) => "https://corsproxy.io/?url=" + encodeURIComponent(u), wrapped: false },
-          // 3) allorigins（會把回應包在 { contents } 內）
-          { build: (u) => "https://api.allorigins.win/get?url=" + encodeURIComponent(u), wrapped: true },
-        ];
-
-        let lastError = null;
-        for (const 代理 of 代理清單) {
-          try {
-            const resp = await fetch(代理.build(target), {
-              method: "POST",
-              headers: { "Content-Type": "application/x-www-form-urlencoded" },
-              body,
-            });
-            if (!resp.ok) {
-              lastError = new Error("標音服務回應 " + resp.status);
-              continue;
-            }
-            let data;
-            if (代理.wrapped) {
-              const outer = await resp.json();
-              data = JSON.parse(outer.contents);
-            } else {
-              data = await resp.json();
-            }
-            if (data && data.分詞) return data.分詞;
-            lastError = new Error("標音結果無分詞資料");
-          } catch (e) {
-            lastError = e;
-          }
-        }
-        throw lastError || new Error("標音失敗");
-      }
-
-      async function speakText(t, l) {
+      function speakText(t, l) {
         if (!synth) return;
-
-        // 1. 攔截台語 (nan-TW)，改用「鬥拍字」意傳科技台語 TTS 服務
-        //    後端：https://hokbu.ithuan.tw/
-        //    流程分兩步：
-        //      (1) 標漢字音標 POST /tau  → 取得「分詞」（受 CORS 限制，需經代理）
-        //      (2) 語音合成   GET  /語音合成?... → 回傳音檔（音訊播放不受 CORS 限制，可直連）
-        if (l === "nan-TW") {
-          showToast("正在生成道地台語語音...", "normal");
-          try {
-            const 網域 = "https://hokbu.ithuan.tw/";
-
-            // === 步驟 1：標漢字音標，取得分詞 ===
-            // hokbu.ithuan.tw 沒有開放 CORS，從其他網域（如 GitHub Pages）
-            // 必須透過 CORS 代理轉送這個 POST 請求。
-            // 下面依序嘗試多個公開代理，任一成功即可；
-            // 若全部失效，可自行架設代理或替換清單。
-            const 分詞 = await 標漢字音標(網域, t.trim());
-            if (!分詞) throw new Error("標音結果無分詞資料");
-
-            // === 步驟 2：語音合成（GET 音檔，可直連，不需代理）===
-            const 腔口 = "閩南語";
-            const ttsUrl = encodeURI(
-              `${網域}語音合成?查詢腔口=${腔口}&查詢語句=${分詞}`
-            );
-
-            const audio = new Audio(ttsUrl);
-            await new Promise((resolve, reject) => {
-              audio.oncanplaythrough = resolve;
-              audio.oncanplay = resolve;
-              audio.onerror = () => reject(new Error("鬥拍字音檔載入失敗"));
-              setTimeout(() => reject(new Error("鬥拍字回應逾時")), 15000);
-            });
-
-            audio.play();
-            return; // 成功播放後，結束函式，不執行下方系統 TTS
-
-          } catch (error) {
-            console.error("台語 TTS 錯誤:", error);
-            showToast("鬥拍字服務無回應，退回系統內建語音", "error");
-            // 若失敗，防呆機制會自動往下走，使用系統內建發音
-          }
-        }
-
-        // 2. 原有的系統內建 TTS (Web Speech API) - 供其他語言或台語失敗時備用
         synth.cancel();
         const voices = synth.getVoices();
         if (voices.length === 0) {
