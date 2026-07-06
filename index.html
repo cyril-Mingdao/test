@@ -927,6 +927,39 @@
       const ITHUAN_MIN_INTERVAL_MS = 21000;
       let lastIthuanRequestTime = 0;
 
+      // 解鎖 <audio> 元素：許多瀏覽器(尤其 iOS Safari)要求 play() 必須緊接在
+      // 使用者手勢之後同步呼叫；我們的合成流程中間隔了一次非同步的 API 請求，
+      // 事後呼叫 play() 常會被靜默擋下。作法是在使用者「第一次」點擊/觸碰畫面時，
+      // 立刻同步播放一段極短靜音音檔「解鎖」該 <audio> 元素，之後同一元素即可在
+      // 非同步流程中正常換源播放。
+      const ITHUAN_SILENT_AUDIO =
+        "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=";
+      let ithuanAudioUnlocked = false;
+      function unlockIthuanAudioPlayer() {
+        if (ithuanAudioUnlocked) return;
+        const player = document.getElementById("ithuanAudioPlayer");
+        player.src = ITHUAN_SILENT_AUDIO;
+        const p = player.play();
+        if (p && p.catch) p.catch(() => {});
+        ithuanAudioUnlocked = true;
+      }
+
+      // 意傳伺服器回傳的 Content-Type 是 application/octet-stream（非 audio/mpeg），
+      // 部分瀏覽器（尤其 Safari）會因此拒絕當作音訊播放。改用 <source type> 明確
+      // 宣告格式，繞過伺服器誤標的類型。
+      function setIthuanAudioSrc(url) {
+        const player = document.getElementById("ithuanAudioPlayer");
+        player.pause();
+        player.removeAttribute("src");
+        player.innerHTML = "";
+        const source = document.createElement("source");
+        source.src = url;
+        source.type = "audio/mpeg";
+        player.appendChild(source);
+        player.load();
+        return player;
+      }
+
       async function textToTaiiloKip(text) {
         const prompt = `Convert the following Taiwanese Hokkien (Tai-gi) text into pure Tai-lo (KIP) romanization with tone diacritics. Output ONLY the romanized text, separated by spaces, no Chinese characters, no explanation, no punctuation other than what marks tone. Text: "${text}"`;
         const res = await fetch(
@@ -963,8 +996,7 @@
           const kip = await textToTaiiloKip(text);
           lastIthuanRequestTime = Date.now();
           const url = `${ITHUAN_TTS_URL}?taibun=${encodeURIComponent(kip)}`;
-          const player = document.getElementById("ithuanAudioPlayer");
-          player.src = url;
+          const player = setIthuanAudioSrc(url);
           await player.play();
           return true;
         } catch (e) {
@@ -1156,6 +1188,12 @@
         initDraggableMic("bottomMicBtn", "bottom");
         initSplitter();
         setupTextPlayback();
+        document.addEventListener("click", unlockIthuanAudioPlayer, {
+          once: true,
+        });
+        document.addEventListener("touchend", unlockIthuanAudioPlayer, {
+          once: true,
+        });
 
         document
           .getElementById("textInput")
