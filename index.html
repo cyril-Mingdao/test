@@ -2096,9 +2096,17 @@
        瀏覽器「混合內容」規則擋掉對 http://127.0.0.1:8000 本機後端的請求（不管本機
        後端有沒有開都一樣連不到），所以辨識改用瀏覽器內建語音辨識
        （window.SpeechRecognition / webkitSpeechRecognition，lang="zh-TW"）現場辨識，
-       免後端、https 環境也能用；同時仍用 MediaRecorder 錄下原始音檔，維持「錄完可以
-       先重播自己的發音，再按『開始評估』看結果」這個既有操作流程——語音辨識在錄音
-       的同時就在背景跑，「開始評估」只是把已經辨識好的結果顯示出來，不是另外再聽一次。
+       免後端、https 環境也能用。
+
+       錄音（MediaRecorder，可重播自己的發音）跟語音辨識曾經試過同時跑，結果在
+       實測時常常整段都抓不到任何辨識結果、也不會報錯——最可能是兩者同時搶同一支
+       麥克風（getUserMedia 開一次、SpeechRecognition 內部自己又開一次）互相卡住。
+       改成「先錄音＋可重播，按『開始評估』那一刻才另外現場聽一次、直接在辨識」：
+       這樣錄音的 getUserMedia 早就在按評估之前釋放掉（mediaRecorder.onstop 裡就
+       stop 了 track），麥克風是空的，辨識才啟動，兩者不會搶資源；而且 recognition.
+       start() 直接寫在按鈕的 click handler 裡（同步呼叫，不是包在 promise .then()
+       裡才呼叫），也比較符合部分瀏覽器對「麥克風類 API 需要直接來自使用者操作」的要求。
+
        逐詞對錯標示利用 applyTailo() 同一套「頁面漢字 → 第幾組(詞)」對照表，把整句
        字元級的編輯距離比對結果，依詞界線捲回成「這個詞算對還是錯」。
        ⚠️ 瀏覽器語音辨識本來就是抓「近似發音的華語字」，不是正確台語漢字，因此不管
@@ -2110,50 +2118,6 @@
     let isRecording = false;
     let currentRecordSeq = null;
     let recordingStream = null;
-    let currentRecognition = null;
-    let pendingRecognizedText = null;
-    let lastRecognitionError = null;
-
-    /* webkitSpeechRecognition 在 continuous:true 模式下常常整段錄音都不觸發 onresult
-       （Chromium known issue），改用 continuous:false 單句辨識，每次辨識一結束
-       （onend）就在還在錄音中的情況下自動重啟，涵蓋整段錄音時間。 */
-    function startSpeechRecognitionLoop(seqIndex) {
-      if (!SpeechRecognitionCtor) return;
-
-      const recognition = new SpeechRecognitionCtor();
-      recognition.lang = 'zh-TW';
-      recognition.continuous = false;
-      recognition.interimResults = false;
-      recognition.maxAlternatives = 1;
-      currentRecognition = recognition;
-
-      recognition.onresult = function(e) {
-        let finalText = '';
-        for (let i = 0; i < e.results.length; i++) {
-          if (e.results[i].isFinal) finalText += e.results[i][0].transcript;
-        }
-        if (finalText) {
-          pendingRecognizedText = (pendingRecognizedText || '') + finalText;
-        }
-      };
-      recognition.onerror = function(e) {
-        console.warn('語音辨識錯誤:', e.error);
-        lastRecognitionError = e.error;
-      };
-      recognition.onend = function() {
-        if (currentRecognition !== recognition) return;   // 已經被下一輪取代，忽略
-        currentRecognition = null;
-        if (isRecording && currentRecordSeq === seqIndex) {
-          startSpeechRecognitionLoop(seqIndex);   // 還在錄音中就馬上重啟，繼續聽
-        }
-      };
-
-      try {
-        recognition.start();
-      } catch (err) {
-        console.error('無法啟動語音辨識:', err);
-      }
-    }
 
     function toggleRecording(event, seqIndex, targetText) {
       event.stopPropagation();
@@ -2176,9 +2140,6 @@
         return;
       }
 
-      pendingRecognizedText = null;
-      lastRecognitionError = null;
-
       navigator.mediaDevices.getUserMedia({ audio: true })
         .then(stream => {
           recordingStream = stream;
@@ -2194,7 +2155,10 @@
           mediaRecorder.onstop = () => {
             const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
             const audioUrl = URL.createObjectURL(audioBlob);
-            const recognizedText = pendingRecognizedText;
+
+            // 錄音的麥克風在這裡就整個釋放掉，之後按「開始評估」才啟動語音辨識，
+            // 兩者不會搶同一支麥克風。
+            recordingStream.getTracks().forEach(track => track.stop());
 
             statusDiv.innerHTML = `
               <div class="speak-controls">
@@ -2206,10 +2170,8 @@
               playRecord(e, audioUrl);
             });
             statusDiv.querySelector('.speak-eval-btn').addEventListener('click', function(e) {
-              evaluateSpeech(e, seqIndex, targetText, recognizedText);
+              evaluateSpeech(e, seqIndex, targetText);
             });
-
-            recordingStream.getTracks().forEach(track => track.stop());
           };
 
           mediaRecorder.start();
@@ -2217,9 +2179,6 @@
           btn.classList.add('recording');
           statusDiv.innerHTML = `<span class="pulse-dot">🔴</span> 錄音中…請跟著唸這句，唸完再按一次麥克風結束`;
           resultDiv.innerHTML = '';
-
-          // 語音辨識跟錄音同時進行，錄音結束時辨識結果通常已經到位
-          startSpeechRecognitionLoop(seqIndex);
         })
         .catch(err => {
           console.error('無法取得麥克風權限:', err);
@@ -2230,9 +2189,6 @@
     function stopRecording() {
       if (mediaRecorder && mediaRecorder.state === 'recording') {
         mediaRecorder.stop();
-      }
-      if (currentRecognition) {
-        try { currentRecognition.stop(); } catch (e) {}
       }
       isRecording = false;
       const btn = document.getElementById('mic-S-' + currentRecordSeq);
@@ -2248,36 +2204,68 @@
       audio.play().catch(err => console.error('播放錄音失敗:', err));
     }
 
-    function evaluateSpeech(event, seqIndex, targetText, recognizedText) {
+    /* 「開始評估」被按下這一刻才現場啟動語音辨識（同步呼叫 recognition.start()，
+       不是包在 promise 裡才呼叫），請學生對著麥克風再唸一次這句。 */
+    function evaluateSpeech(event, seqIndex, targetText) {
       event.stopPropagation();
       const statusDiv = document.getElementById('status-S-' + seqIndex);
       const resultDiv = document.getElementById('result-S-' + seqIndex);
 
-      statusDiv.innerHTML = '⚙️ 正在比對中…';
       resultDiv.innerHTML = '';
 
-      setTimeout(() => {
-        if (!SpeechRecognitionCtor) {
-          statusDiv.innerHTML = '⚠️ 這個瀏覽器不支援語音辨識，請改用電腦版或手機版的 Chrome／Edge。';
-          return;
+      if (!SpeechRecognitionCtor) {
+        statusDiv.innerHTML = '⚠️ 這個瀏覽器不支援語音辨識，請改用電腦版或手機版的 Chrome／Edge。';
+        return;
+      }
+
+      const recognition = new SpeechRecognitionCtor();
+      recognition.lang = 'zh-TW';
+      recognition.continuous = false;
+      recognition.interimResults = false;
+      recognition.maxAlternatives = 1;
+
+      statusDiv.innerHTML = `<span class="pulse-dot">🔴</span> 請對著麥克風再唸一次這句，唸完稍等一下…`;
+
+      let done = false;
+
+      recognition.onresult = function(e) {
+        let text = '';
+        for (let i = 0; i < e.results.length; i++) {
+          if (e.results[i].isFinal) text += e.results[i][0].transcript;
         }
-        if (!recognizedText) {
-          let hint = '⚠️ 沒有辨識到聲音內容，請重錄一次，並對著麥克風清楚唸出這句。';
-          if (lastRecognitionError === 'not-allowed' || lastRecognitionError === 'service-not-allowed') {
-            hint += '（偵測到麥克風權限被拒絕，請允許瀏覽器使用麥克風）';
-          } else if (lastRecognitionError === 'network') {
-            hint += '（偵測到網路連線問題，語音辨識需要連網才能運作，也可能是被瀏覽器擴充功能／防火牆擋住）';
-          } else if (lastRecognitionError === 'no-speech') {
-            hint += '（沒有偵測到說話聲，請靠近麥克風、聲音再大聲一點）';
-          } else if (lastRecognitionError) {
-            hint += `（辨識錯誤代碼：${lastRecognitionError}）`;
-          }
-          statusDiv.innerHTML = hint;
-          return;
-        }
+        done = true;
         statusDiv.innerHTML = '✅ 分析完成';
-        showEvaluationResult(seqIndex, targetText, recognizedText);
-      }, 400);
+        showEvaluationResult(seqIndex, targetText, text);
+      };
+
+      recognition.onerror = function(e) {
+        console.warn('語音辨識錯誤:', e.error);
+        done = true;
+        if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+          statusDiv.innerHTML = '⚠️ 沒有麥克風權限，請允許瀏覽器使用麥克風後再按一次「開始評估」。';
+        } else if (e.error === 'network') {
+          statusDiv.innerHTML = '⚠️ 語音辨識連線失敗（需要連網才能辨識，也可能被瀏覽器擴充功能／防火牆擋住），請確認後再試一次。';
+        } else if (e.error === 'no-speech') {
+          statusDiv.innerHTML = '⚠️ 沒有聽到聲音，請靠近麥克風、聲音再大聲一點，再按一次「開始評估」重試。';
+        } else if (e.error === 'aborted') {
+          statusDiv.innerHTML = '';
+        } else {
+          statusDiv.innerHTML = `⚠️ 辨識失敗（錯誤代碼：${e.error}），請再按一次「開始評估」重試。`;
+        }
+      };
+
+      recognition.onend = function() {
+        if (!done) {
+          statusDiv.innerHTML = '⚠️ 沒有辨識到聲音內容，請再按一次「開始評估」重試。';
+        }
+      };
+
+      try {
+        recognition.start();
+      } catch (err) {
+        console.error('無法啟動語音辨識:', err);
+        statusDiv.innerHTML = '⚠️ 無法啟動語音辨識，請再試一次。';
+      }
     }
 
     function levenshteinDistance(s1, s2) {
