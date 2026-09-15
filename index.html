@@ -2309,7 +2309,11 @@
       if (!r || !t) return 0;
       const dist = levenshteinDistance(Array.from(r), Array.from(t));
       const maxLen = Math.max(r.length, t.length);
-      return Math.round((1 - dist / maxLen) * 100);
+      const raw = (1 - dist / maxLen) * 100;
+      // 辨識引擎本身只抓得到「近似音」，原始分數對學生來說太嚴苛，
+      // 把跟 100 分的差距壓縮 25%，放寬整體標準。
+      const eased = raw + (100 - raw) * 0.25;
+      return Math.round(Math.max(0, Math.min(100, eased)));
     }
 
     /* 逐字編輯距離對齊＋回溯：回傳跟 target 等長的陣列，
@@ -2377,7 +2381,9 @@
         const len = Array.from(word).length;
         const wordMarks = marks.slice(pos, pos + len);
         pos += len;
-        const ok = wordMarks.length > 0 && wordMarks.every(mk => mk === 'match');
+        // 詞內超過一半的字有對上就算過，不用整個詞逐字都對才算對，放寬逐詞標示的標準。
+        const matchedCount = wordMarks.filter(mk => mk === 'match').length;
+        const ok = wordMarks.length > 0 && matchedCount / wordMarks.length >= 0.5;
         html += `<span class="word-diff ${ok ? 'word-ok' : 'word-bad'}">${escapeHtml(word)}</span>`;
       });
       return html;
@@ -2391,10 +2397,10 @@
       // 分數太貼近嚴格對錯容易讓學生誤以為自己唸錯了。
       const score = computeSimilarity(recognizedText, targetText);
       let feedbackText, scoreClass;
-      if (score >= 80) {
+      if (score >= 70) {
         feedbackText = '🌟 太棒了，發音很接近！';
         scoreClass = 'score-excellent';
-      } else if (score >= 55) {
+      } else if (score >= 40) {
         feedbackText = '👍 不錯，再練習幾次會更好！';
         scoreClass = 'score-good';
       } else {
