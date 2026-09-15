@@ -2078,9 +2078,9 @@
     /* ===================== 跟讀錄音與聲音相似度評分 =====================
        不用語音辨識（不管本機 whisper 或瀏覽器內建，對台語都只能辨識出「近似音」的
        華語字），改成直接比對「錄音」跟「範例音檔」兩段聲音本身的相似度：
-       範例音檔是用專案既有的 TTS 管線（意傳媠聲）事先為每一句合成好的 wav，
-       跟這支 html 一起放在同資料夾的 audio/s<句序>.wav，純靜態檔案、不需要後端，
-       https（Google Sites 嵌入）環境也能直接 fetch。
+       範例音檔是用專案既有的 TTS 管線（意傳媠聲）事先為每一句合成好的 mp3，
+       放在 GitHub Pages（REF_AUDIO_BASE）。一律用完整網址讀取：這支 html 會被貼進
+       Google Sites 內嵌程式碼，那裡相對路徑找不到檔案；GitHub Pages 有開 CORS，可以跨網域 fetch。
 
        比對方式：兩段音檔都用 Web Audio API 解碼、重取樣到同一個取樣率，
        切成一小段一小段（frame）算「音量（RMS）」和「過零率（ZCR，粗略反映音色明亮度）」
@@ -2317,10 +2317,11 @@
 
     /* ---------- 範例音檔載入（快取，同一句只抓一次） ---------- */
 
+    const REF_AUDIO_BASE = 'https://cyril-mingdao.github.io/test/audio/YUDA-B1L1/';
     const refAudioCache = {};
     function loadReferenceAudio(seqIndex) {
       if (refAudioCache[seqIndex]) return refAudioCache[seqIndex];
-      const url = `audio/s${seqIndex}.wav`;
+      const url = `${REF_AUDIO_BASE}s${seqIndex}.mp3`;
       const p = fetch(url)
         .then(res => {
           if (!res.ok) throw new Error('HTTP ' + res.status);
@@ -2330,6 +2331,7 @@
         .catch(err => {
           delete refAudioCache[seqIndex];
           console.error('無法載入範例音檔:', url, err);
+          err.stage = 'ref';
           throw err;
         });
       refAudioCache[seqIndex] = p;
@@ -2347,7 +2349,9 @@
       statusDiv.innerHTML = '⚙️ 正在比對聲音中…';
 
       Promise.all([
-        audioBlob.arrayBuffer().then(buf => decodeAudioSamples(getAudioCtx(), buf)),
+        audioBlob.arrayBuffer()
+          .then(buf => decodeAudioSamples(getAudioCtx(), buf))
+          .catch(err => { err.stage = 'rec'; throw err; }),
         loadReferenceAudio(seqIndex)
       ])
         .then(([rec, ref]) => {
@@ -2361,7 +2365,13 @@
         })
         .catch(err => {
           console.error('聲音比對失敗:', err);
-          statusDiv.innerHTML = '⚠️ 沒辦法完成聲音比對，請確認網路連線、或重新錄音後再試一次。';
+          if (err && err.stage === 'ref') {
+            statusDiv.innerHTML = '⚠️ 讀不到這一句的範例音檔，請確認網路連線；若持續發生，請老師確認音檔已上傳到 GitHub。';
+          } else if (err && err.stage === 'rec') {
+            statusDiv.innerHTML = '⚠️ 這段錄音無法解析，可能太短或沒錄到聲音，請重新錄一次。';
+          } else {
+            statusDiv.innerHTML = '⚠️ 沒辦法完成聲音比對，請重新錄音後再試一次。';
+          }
         });
     }
 
