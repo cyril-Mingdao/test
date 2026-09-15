@@ -542,20 +542,11 @@
       word-break: break-all;
     }
 
-    .speak-offline-warning,
     .speak-accuracy-note {
       margin-top: 8px;
       padding: 6px 10px;
       border-radius: 10px;
       font-size: 0.9em;
-    }
-
-    .speak-offline-warning {
-      background: var(--yellow-soft);
-      color: var(--ink);
-    }
-
-    .speak-accuracy-note {
       background: #eeeeee;
       color: #555;
     }
@@ -2101,23 +2092,26 @@
     }
 
     /* ===================== 跟讀錄音與逐詞評分 =====================
-       錄音／上傳／整句相似度打分的邏輯沿用專案既有的
-       src/generators/templates/interactive_website.html.j2（瀏覽器錄音 → 呼叫本機
-       FastAPI /api/stt → 沒開就自動退回模擬評分）；逐詞對錯標示是本頁新增的部分，
-       利用 applyTailo() 同一套「頁面漢字 → 第幾組(詞)」對照表，把整句字元級的編輯
-       距離比對結果，依詞界線捲回成「這個詞算對還是錯」。
-       ⚠️ 辨識引擎（faster-whisper／Breeze-ASR-26）目前只能辨識出台語發音的近似華語字，
-       不是正確台語漢字，因此不管整句分數或逐詞標示，都只能當練習參考，不是正式評量。
+       學生實際上課用的是嵌進 Google Sites 的 https 版本，https 頁面本來就會被
+       瀏覽器「混合內容」規則擋掉對 http://127.0.0.1:8000 本機後端的請求（不管本機
+       後端有沒有開都一樣連不到），所以辨識改用瀏覽器內建語音辨識
+       （window.SpeechRecognition / webkitSpeechRecognition，lang="zh-TW"）現場辨識，
+       免後端、https 環境也能用；同時仍用 MediaRecorder 錄下原始音檔，維持「錄完可以
+       先重播自己的發音，再按『開始評估』看結果」這個既有操作流程——語音辨識在錄音
+       的同時就在背景跑，「開始評估」只是把已經辨識好的結果顯示出來，不是另外再聽一次。
+       逐詞對錯標示利用 applyTailo() 同一套「頁面漢字 → 第幾組(詞)」對照表，把整句
+       字元級的編輯距離比對結果，依詞界線捲回成「這個詞算對還是錯」。
+       ⚠️ 瀏覽器語音辨識本來就是抓「近似發音的華語字」，不是正確台語漢字，因此不管
+       整句分數或逐詞標示，都只能當練習參考，不是正式評量。 */
 
-       備註（2026-09-15）：曾經試過改用瀏覽器內建 SpeechRecognition（免後端，但辨識
-       效果不佳），已改回這一版「錄音＋本機後端／沒開就模擬評分」＋「可重播自己錄音」
-       的做法。 */
-
+    const SpeechRecognitionCtor = window.SpeechRecognition || window.webkitSpeechRecognition;
     let mediaRecorder = null;
     let audioChunks = [];
     let isRecording = false;
     let currentRecordSeq = null;
     let recordingStream = null;
+    let currentRecognition = null;
+    let pendingRecognizedText = null;
 
     function toggleRecording(event, seqIndex, targetText) {
       event.stopPropagation();
@@ -2140,6 +2134,8 @@
         return;
       }
 
+      pendingRecognizedText = null;
+
       navigator.mediaDevices.getUserMedia({ audio: true })
         .then(stream => {
           recordingStream = stream;
@@ -2155,6 +2151,7 @@
           mediaRecorder.onstop = () => {
             const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
             const audioUrl = URL.createObjectURL(audioBlob);
+            const recognizedText = pendingRecognizedText;
 
             statusDiv.innerHTML = `
               <div class="speak-controls">
@@ -2166,7 +2163,7 @@
               playRecord(e, audioUrl);
             });
             statusDiv.querySelector('.speak-eval-btn').addEventListener('click', function(e) {
-              evaluateSpeech(e, seqIndex, targetText, audioBlob);
+              evaluateSpeech(e, seqIndex, targetText, recognizedText);
             });
 
             recordingStream.getTracks().forEach(track => track.stop());
@@ -2175,8 +2172,35 @@
           mediaRecorder.start();
           btn.textContent = '⏹️';
           btn.classList.add('recording');
-          statusDiv.innerHTML = `<span class="pulse-dot">🔴</span> 錄音中…再按一次麥克風結束`;
+          statusDiv.innerHTML = `<span class="pulse-dot">🔴</span> 錄音中…請跟著唸這句，唸完再按一次麥克風結束`;
           resultDiv.innerHTML = '';
+
+          // 語音辨識跟錄音同時進行，錄音結束時辨識結果通常已經到位
+          if (SpeechRecognitionCtor) {
+            const recognition = new SpeechRecognitionCtor();
+            recognition.lang = 'zh-TW';
+            recognition.continuous = true;
+            recognition.interimResults = false;
+            recognition.maxAlternatives = 1;
+            currentRecognition = recognition;
+
+            let finalTranscript = '';
+            recognition.onresult = function(e) {
+              for (let i = e.resultIndex; i < e.results.length; i++) {
+                if (e.results[i].isFinal) {
+                  finalTranscript += e.results[i][0].transcript;
+                }
+              }
+              pendingRecognizedText = finalTranscript;
+            };
+            recognition.onerror = function(e) {
+              console.warn('語音辨識錯誤:', e.error);
+            };
+            recognition.onend = function() {
+              if (currentRecognition === recognition) currentRecognition = null;
+            };
+            try { recognition.start(); } catch (err) { console.error('無法啟動語音辨識:', err); }
+          }
         })
         .catch(err => {
           console.error('無法取得麥克風權限:', err);
@@ -2187,6 +2211,9 @@
     function stopRecording() {
       if (mediaRecorder && mediaRecorder.state === 'recording') {
         mediaRecorder.stop();
+      }
+      if (currentRecognition) {
+        try { currentRecognition.stop(); } catch (e) {}
       }
       isRecording = false;
       const btn = document.getElementById('mic-S-' + currentRecordSeq);
@@ -2202,41 +2229,26 @@
       audio.play().catch(err => console.error('播放錄音失敗:', err));
     }
 
-    function evaluateSpeech(event, seqIndex, targetText, audioBlob) {
+    function evaluateSpeech(event, seqIndex, targetText, recognizedText) {
       event.stopPropagation();
       const statusDiv = document.getElementById('status-S-' + seqIndex);
       const resultDiv = document.getElementById('result-S-' + seqIndex);
 
-      statusDiv.innerHTML = '⚙️ 正在分析語音中…';
+      statusDiv.innerHTML = '⚙️ 正在比對中…';
       resultDiv.innerHTML = '';
 
-      const formData = new FormData();
-      formData.append('file', audioBlob, 'recording.webm');
-      formData.append('target_text', targetText);
-
-      fetch('http://127.0.0.1:8000/api/stt', {
-        method: 'POST',
-        body: formData
-      })
-        .then(res => {
-          if (!res.ok) throw new Error('HTTP error: ' + res.status);
-          return res.json();
-        })
-        .then(data => {
-          showEvaluationResult(seqIndex, targetText, data.text || '', false);
-        })
-        .catch(err => {
-          console.warn('無法連接到本地語音伺服器，自動切換為模擬評分模式:', err);
-          setTimeout(() => {
-            const simSuccess = Math.random() > 0.15;
-            let recognizedText = targetText;
-            if (!simSuccess && targetText.length > 2) {
-              const cut = Math.max(1, targetText.length - 2);
-              recognizedText = targetText.slice(0, cut);
-            }
-            showEvaluationResult(seqIndex, targetText, recognizedText, true);
-          }, 800);
-        });
+      setTimeout(() => {
+        if (!SpeechRecognitionCtor) {
+          statusDiv.innerHTML = '⚠️ 這個瀏覽器不支援語音辨識，請改用電腦版或手機版的 Chrome／Edge。';
+          return;
+        }
+        if (!recognizedText) {
+          statusDiv.innerHTML = '⚠️ 沒有辨識到聲音內容，請重錄一次，並對著麥克風清楚唸出這句。';
+          return;
+        }
+        statusDiv.innerHTML = '✅ 分析完成';
+        showEvaluationResult(seqIndex, targetText, recognizedText);
+      }, 400);
     }
 
     function levenshteinDistance(s1, s2) {
@@ -2348,19 +2360,18 @@
       return html;
     }
 
-    function showEvaluationResult(seqIndex, targetText, recognizedText, isOfflineSim) {
+    function showEvaluationResult(seqIndex, targetText, recognizedText) {
       const s = allSentences[seqIndex];
-      const statusDiv = document.getElementById('status-S-' + seqIndex);
       const resultDiv = document.getElementById('result-S-' + seqIndex);
 
-      statusDiv.innerHTML = '✅ 分析完成';
-
+      // 門檻刻意放寬、用語偏鼓勵：辨識引擎本身只抓得到「近似音」，
+      // 分數太貼近嚴格對錯容易讓學生誤以為自己唸錯了。
       const score = computeSimilarity(recognizedText, targetText);
       let feedbackText, scoreClass;
-      if (score >= 90) {
+      if (score >= 80) {
         feedbackText = '🌟 太棒了，發音很接近！';
         scoreClass = 'score-excellent';
-      } else if (score >= 70) {
+      } else if (score >= 55) {
         feedbackText = '👍 不錯，再練習幾次會更好！';
         scoreClass = 'score-good';
       } else {
@@ -2370,12 +2381,6 @@
 
       const wordsHtml = buildWordDiffHtml(s, targetText, recognizedText);
 
-      const offlineWarning = isOfflineSim ? `
-        <div class="speak-offline-warning">
-          ⚠️ 偵測到本機語音伺服器（127.0.0.1:8000）未開啟，已自動切換為模擬評分模式，僅供介面展示。
-        </div>
-      ` : '';
-
       resultDiv.innerHTML = `
         <div class="speak-eval-card">
           <div class="speak-eval-score-row">
@@ -2384,8 +2389,7 @@
           </div>
           <div class="speak-eval-words">${wordsHtml}</div>
           <div class="speak-eval-details">辨識結果：${escapeHtml(recognizedText) || '(無)'}</div>
-          ${offlineWarning}
-          <div class="speak-accuracy-note">⚠️ 台語語音辨識目前只能辨識出「近似音」的華語字，逐詞紅綠標示僅供練習參考，不是正式發音評量。</div>
+          <div class="speak-accuracy-note">⚠️ 這裡用的是瀏覽器內建語音辨識（辨識成「近似音」的華語字，不是正確台語漢字），逐詞紅綠標示跟分數僅供練習參考，不是正式發音評量。</div>
         </div>
       `;
     }
