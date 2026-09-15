@@ -512,34 +512,48 @@
       font-size: 1.05em;
     }
 
-    .speak-eval-words {
+    .speak-contour-wrap {
       margin: 8px 0;
-      font-size: 1.6em;
-      line-height: 2.1;
     }
 
-    .word-diff {
-      display: inline-block;
-      padding: 0 2px;
-      margin: 0 1px;
-      border-radius: 4px;
+    .speak-contour {
+      width: 100%;
+      height: 60px;
+      display: block;
+      background: #fafafa;
+      border: 1px solid var(--line);
+      border-radius: 8px;
     }
 
-    .word-diff.word-ok {
-      background: #d3f4d9;
-      color: #1a6b2f;
+    .speak-contour polyline {
+      stroke-width: 2;
+      vector-effect: non-scaling-stroke;
     }
 
-    .word-diff.word-bad {
-      background: #fbdada;
-      color: #a3271b;
-      text-decoration: underline wavy #a3271b;
+    .speak-contour .contour-ref {
+      stroke: var(--black);
+      opacity: 0.55;
     }
 
-    .speak-eval-details {
-      font-size: 0.95em;
-      color: #555;
-      word-break: break-all;
+    .speak-contour .contour-rec {
+      stroke: #e6b800;
+    }
+
+    .speak-contour-legend {
+      display: flex;
+      gap: 14px;
+      margin-top: 4px;
+      font-size: 0.9em;
+    }
+
+    .speak-contour-legend .legend-ref {
+      color: var(--black);
+      opacity: 0.7;
+    }
+
+    .speak-contour-legend .legend-rec {
+      color: #b38f00;
+      font-weight: bold;
     }
 
     .speak-accuracy-note {
@@ -1871,28 +1885,12 @@
 
     /* ===================== 渲染 ===================== */
 
-    /* 逐句詞界線：跟 applyTailo() 用同一套「頁面漢字 → 第幾組(詞)」攤平表，
-       只是這裡按句子切片，取出每一句對應的詞清單，供跟讀逐詞對錯標示使用。 */
-    const pageFlatCache = {};
-    function getPageFlat(pageNum) {
-      if (pageFlatCache[pageNum]) return pageFlatCache[pageNum];
-      const groups = (typeof tailo !== 'undefined' && tailo[pageNum]) || [];
-      const flat = [];
-      groups.forEach((g, gi) => {
-        Array.from(g[0]).forEach((ch, ci) => flat.push({ gi: gi, ci: ci }));
-      });
-      pageFlatCache[pageNum] = { flat: flat, groups: groups };
-      return pageFlatCache[pageNum];
-    }
-
     function renderContent() {
       const contentArea = document.getElementById('content-area');
       contentArea.innerHTML = '';
       allSentences.length = 0;
 
       Object.keys(pages).forEach(pageNum => {
-        let hanziCursor = 0;   // 該頁已消耗的漢字數，對應 getPageFlat() 的攤平索引
-
         const section = document.createElement('div');
         section.className = 'page-section';
 
@@ -1938,21 +1936,7 @@
 
           content.appendChild(span);
 
-          // 用漢字數把這一句對應到 tailo 攤平表裡的詞清單（跟 applyTailo() 走同一條字元流）
-          const hanziChars = Array.from(sentence.text).filter(c => HANZI.test(c));
-          const { flat, groups } = getPageFlat(pageNum);
-          const sliceEntries = flat.slice(hanziCursor, hanziCursor + hanziChars.length);
-          hanziCursor += hanziChars.length;
-          const words = [];
-          let prevGi = null;
-          sliceEntries.forEach(info => {
-            if (info.gi !== prevGi && groups[info.gi]) {
-              words.push(groups[info.gi][0]);
-              prevGi = info.gi;
-            }
-          });
-
-          allSentences.push({ page: pageNum, idx: idx, text: sentence.text, el: span, words: words });
+          allSentences.push({ page: pageNum, idx: idx, text: sentence.text, el: span });
 
           span.addEventListener('click', function() {
             onSentenceClick(seqIndex);
@@ -1969,7 +1953,7 @@
           content.appendChild(resultDiv);
 
           span.querySelector('.mic-btn').addEventListener('click', function(e) {
-            toggleRecording(e, seqIndex, sentence.text);
+            toggleRecording(e, seqIndex);
           });
         });
 
@@ -2091,37 +2075,28 @@
       });
     }
 
-    /* ===================== 跟讀錄音與逐詞評分 =====================
-       學生實際上課用的是嵌進 Google Sites 的 https 版本，https 頁面本來就會被
-       瀏覽器「混合內容」規則擋掉對 http://127.0.0.1:8000 本機後端的請求（不管本機
-       後端有沒有開都一樣連不到），所以辨識改用瀏覽器內建語音辨識
-       （window.SpeechRecognition / webkitSpeechRecognition，lang="zh-TW"）現場辨識，
-       免後端、https 環境也能用。
+    /* ===================== 跟讀錄音與聲音相似度評分 =====================
+       不用語音辨識（不管本機 whisper 或瀏覽器內建，對台語都只能辨識出「近似音」的
+       華語字），改成直接比對「錄音」跟「範例音檔」兩段聲音本身的相似度：
+       範例音檔是用專案既有的 TTS 管線（意傳媠聲）事先為每一句合成好的 wav，
+       跟這支 html 一起放在同資料夾的 audio/s<句序>.wav，純靜態檔案、不需要後端，
+       https（Google Sites 嵌入）環境也能直接 fetch。
 
-       只錄一次：MediaRecorder（給重播用）跟 SpeechRecognition 同時啟動，兩者都是
-       同一次開口講話。之前試過 recognition.continuous = true 想讓辨識跟錄音一樣
-       由使用者手動結束，但 continuous:true 是 Chromium 長年的已知問題，常常整段
-       都不觸發 onresult；改成 continuous:false（單句模式，支援度好很多），辨識
-       偵測到這句講完就會自動觸發 onend，這裡就同步呼叫 stopRecording()，把錄音也
-       一起停掉——使用者只需要開口一次，講完稍微停頓，錄音跟辨識就會一起收尾，不用
-       手動按第二次、也不用再唸第二遍。
+       比對方式：兩段音檔都用 Web Audio API 解碼、重取樣到同一個取樣率，
+       切成一小段一小段（frame）算「音量（RMS）」和「過零率（ZCR，粗略反映音色明亮度）」
+       兩個特徵，再用動態時間規整（DTW）把長短不一定的兩段特徵序列對齊、算出平均差距，
+       轉成 0～100 分。
 
-       逐詞對錯標示利用 applyTailo() 同一套「頁面漢字 → 第幾組(詞)」對照表，把整句
-       字元級的編輯距離比對結果，依詞界線捲回成「這個詞算對還是錯」。
-       ⚠️ 瀏覽器語音辨識本來就是抓「近似發音的華語字」，不是正確台語漢字，因此不管
-       整句分數或逐詞標示，都只能當練習參考，不是正式評量。 */
+       ⚠️ 這只是「聲音的節奏／音量走勢像不像」，沒有語意內容，沒辦法像文字辨識那樣
+       標出「哪個字唸錯」，分數也不等於「有沒有唸對」，純粹是練習參考用的整體印象分數。 */
 
-    const SpeechRecognitionCtor = window.SpeechRecognition || window.webkitSpeechRecognition;
     let mediaRecorder = null;
     let audioChunks = [];
     let isRecording = false;
     let currentRecordSeq = null;
     let recordingStream = null;
-    let currentRecognition = null;
-    let pendingRecognizedText = null;
-    let lastRecognitionError = null;
 
-    function toggleRecording(event, seqIndex, targetText) {
+    function toggleRecording(event, seqIndex) {
       event.stopPropagation();
       const micBtn = document.getElementById('mic-S-' + seqIndex);
       const statusDiv = document.getElementById('status-S-' + seqIndex);
@@ -2133,17 +2108,14 @@
         if (wasSameSentence) return;
       }
 
-      startRecording(seqIndex, targetText, micBtn, statusDiv, resultDiv);
+      startRecording(seqIndex, micBtn, statusDiv, resultDiv);
     }
 
-    function startRecording(seqIndex, targetText, btn, statusDiv, resultDiv) {
+    function startRecording(seqIndex, btn, statusDiv, resultDiv) {
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         alert('這個瀏覽器不支援錄音功能，請改用電腦版 Chrome 或 Edge。');
         return;
       }
-
-      pendingRecognizedText = null;
-      lastRecognitionError = null;
 
       navigator.mediaDevices.getUserMedia({ audio: true })
         .then(stream => {
@@ -2160,7 +2132,6 @@
           mediaRecorder.onstop = () => {
             const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
             const audioUrl = URL.createObjectURL(audioBlob);
-            const recognizedText = pendingRecognizedText;
 
             recordingStream.getTracks().forEach(track => track.stop());
 
@@ -2174,47 +2145,15 @@
               playRecord(e, audioUrl);
             });
             statusDiv.querySelector('.speak-eval-btn').addEventListener('click', function(e) {
-              evaluateSpeech(e, seqIndex, targetText, recognizedText);
+              evaluateAudio(e, seqIndex, audioBlob);
             });
           };
 
           mediaRecorder.start();
           btn.textContent = '⏹️';
           btn.classList.add('recording');
-          statusDiv.innerHTML = `<span class="pulse-dot">🔴</span> 錄音中…請跟著唸這句，唸完稍停一下會自動結束`;
+          statusDiv.innerHTML = `<span class="pulse-dot">🔴</span> 錄音中…請跟著唸這句，唸完再按一次麥克風結束`;
           resultDiv.innerHTML = '';
-
-          // 語音辨識跟錄音同時開始；辨識偵測到這句講完就會自動一起收尾（見下方 onend）
-          if (SpeechRecognitionCtor) {
-            const recognition = new SpeechRecognitionCtor();
-            recognition.lang = 'zh-TW';
-            recognition.continuous = false;
-            recognition.interimResults = false;
-            recognition.maxAlternatives = 1;
-            currentRecognition = recognition;
-
-            recognition.onresult = function(e) {
-              let text = '';
-              for (let i = 0; i < e.results.length; i++) {
-                if (e.results[i].isFinal) text += e.results[i][0].transcript;
-              }
-              pendingRecognizedText = text;
-            };
-            recognition.onerror = function(e) {
-              console.warn('語音辨識錯誤:', e.error);
-              lastRecognitionError = e.error;
-            };
-            recognition.onend = function() {
-              if (currentRecognition !== recognition) return;
-              currentRecognition = null;
-              // 辨識這句已經結束（不管有沒有抓到結果），順便把錄音也停掉，
-              // 使用者不用再手動按一次麥克風。
-              if (isRecording && currentRecordSeq === seqIndex) {
-                stopRecording();
-              }
-            };
-            try { recognition.start(); } catch (err) { console.error('無法啟動語音辨識:', err); }
-          }
         })
         .catch(err => {
           console.error('無法取得麥克風權限:', err);
@@ -2225,9 +2164,6 @@
     function stopRecording() {
       if (mediaRecorder && mediaRecorder.state === 'recording') {
         mediaRecorder.stop();
-      }
-      if (currentRecognition) {
-        try { currentRecognition.stop(); } catch (e) {}
       }
       isRecording = false;
       const btn = document.getElementById('mic-S-' + currentRecordSeq);
@@ -2243,172 +2179,229 @@
       audio.play().catch(err => console.error('播放錄音失敗:', err));
     }
 
-    function evaluateSpeech(event, seqIndex, targetText, recognizedText) {
+    /* ---------- 聲音特徵擷取與 DTW 相似度 ---------- */
+
+    let sharedAudioCtx = null;
+    function getAudioCtx() {
+      if (!sharedAudioCtx) {
+        const Ctor = window.AudioContext || window.webkitAudioContext;
+        sharedAudioCtx = new Ctor();
+      }
+      return sharedAudioCtx;
+    }
+
+    function decodeAudioSamples(audioCtx, arrayBuffer) {
+      return new Promise((resolve, reject) => {
+        audioCtx.decodeAudioData(arrayBuffer.slice(0), buffer => {
+          let mono = buffer.getChannelData(0);
+          if (buffer.numberOfChannels > 1) {
+            mono = new Float32Array(buffer.length);
+            for (let c = 0; c < buffer.numberOfChannels; c++) {
+              const data = buffer.getChannelData(c);
+              for (let i = 0; i < buffer.length; i++) mono[i] += data[i] / buffer.numberOfChannels;
+            }
+          }
+          resolve({ samples: mono, sampleRate: buffer.sampleRate });
+        }, reject);
+      });
+    }
+
+    /* 錄音跟範例音檔解碼出來的取樣率不一定一樣（瀏覽器解碼常會用自己的
+       AudioContext 取樣率），統一線性重取樣到同一個取樣率，兩邊每一幀代表
+       的實際時間長度才會一致，DTW 比對才公平。 */
+    function resampleLinear(samples, fromRate, toRate) {
+      if (fromRate === toRate) return samples;
+      const ratio = fromRate / toRate;
+      const newLen = Math.max(1, Math.floor(samples.length / ratio));
+      const out = new Float32Array(newLen);
+      for (let i = 0; i < newLen; i++) {
+        const srcPos = i * ratio;
+        const i0 = Math.floor(srcPos);
+        const i1 = Math.min(i0 + 1, samples.length - 1);
+        const frac = srcPos - i0;
+        out[i] = samples[i0] * (1 - frac) + samples[i1] * frac;
+      }
+      return out;
+    }
+
+    const AUDIO_TARGET_SR = 16000;
+    const AUDIO_FRAME_SIZE = 400;   // 25ms
+    const AUDIO_HOP_SIZE = 160;     // 10ms
+    const AUDIO_MAX_SECONDS = 20;   // 超過就截斷，避免誤按錄很久導致 DTW 算太久
+
+    function extractFeatures(samples, sampleRate) {
+      const resampled = resampleLinear(samples, sampleRate, AUDIO_TARGET_SR);
+      const maxSamples = AUDIO_MAX_SECONDS * AUDIO_TARGET_SR;
+      const sig = resampled.length > maxSamples ? resampled.subarray(0, maxSamples) : resampled;
+
+      const rms = [];
+      const zcr = [];
+      for (let start = 0; start + AUDIO_FRAME_SIZE <= sig.length; start += AUDIO_HOP_SIZE) {
+        let sumSq = 0;
+        let crossings = 0;
+        for (let i = 0; i < AUDIO_FRAME_SIZE; i++) {
+          const v = sig[start + i];
+          sumSq += v * v;
+          if (i > 0 && ((sig[start + i - 1] >= 0) !== (v >= 0))) crossings++;
+        }
+        rms.push(Math.sqrt(sumSq / AUDIO_FRAME_SIZE));
+        zcr.push(crossings / AUDIO_FRAME_SIZE);
+      }
+      return { rms, zcr };
+    }
+
+    /* 麥克風錄音前後常會多錄到一小段安靜的空白，裁掉頭尾低於門檻的幀，
+       不然 DTW 對齊會被這段「兩邊都很安靜但不一定等長」的空白拖累。 */
+    function trimSilence(rms, zcr, threshold) {
+      const max = Math.max(1e-6, ...rms);
+      const thr = max * threshold;
+      let start = 0, end = rms.length;
+      while (start < end && rms[start] < thr) start++;
+      while (end > start && rms[end - 1] < thr) end--;
+      if (end - start < 3) return { rms, zcr };  // 太短就整段保留，避免裁過頭
+      return { rms: rms.slice(start, end), zcr: zcr.slice(start, end) };
+    }
+
+    function zscoreNormalize(arr) {
+      const n = arr.length;
+      if (!n) return arr.slice();
+      const mean = arr.reduce((a, b) => a + b, 0) / n;
+      const variance = arr.reduce((a, b) => a + (b - mean) * (b - mean), 0) / n;
+      const sd = Math.sqrt(variance) || 1;
+      return arr.map(v => (v - mean) / sd);
+    }
+
+    /* 動態時間規整（DTW）：featA/featB 是 {rms:[...], zcr:[...]}，長度不用一樣。
+       回傳依實際規整路徑長度正規化過的平均差距，轉成的 0~100 分數。 */
+    function dtwSimilarity(featA, featB) {
+      const n = featA.rms.length;
+      const m = featB.rms.length;
+      if (n < 2 || m < 2) return { score: 0, avgCost: Infinity };
+
+      const rmsA = zscoreNormalize(featA.rms);
+      const rmsB = zscoreNormalize(featB.rms);
+      const zcrA = zscoreNormalize(featA.zcr);
+      const zcrB = zscoreNormalize(featB.zcr);
+
+      const dp = new Array(n + 1);
+      for (let i = 0; i <= n; i++) dp[i] = new Float64Array(m + 1).fill(Infinity);
+      dp[0][0] = 0;
+
+      for (let i = 1; i <= n; i++) {
+        for (let j = 1; j <= m; j++) {
+          const dRms = rmsA[i - 1] - rmsB[j - 1];
+          const dZcr = zcrA[i - 1] - zcrB[j - 1];
+          const cost = Math.sqrt(dRms * dRms + dZcr * dZcr);
+          const best = Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
+          dp[i][j] = cost + best;
+        }
+      }
+
+      let i = n, j = m, pathLen = 0;
+      while (i > 0 || j > 0) {
+        pathLen++;
+        if (i === 0) { j--; continue; }
+        if (j === 0) { i--; continue; }
+        const diag = dp[i - 1][j - 1], up = dp[i - 1][j], left = dp[i][j - 1];
+        if (diag <= up && diag <= left) { i--; j--; }
+        else if (up <= left) { i--; }
+        else { j--; }
+      }
+
+      const avgCost = dp[n][m] / Math.max(1, pathLen);
+      // avgCost 是正規化特徵空間裡的平均步進距離；用指數衰減轉成 0~100 分，
+      // k 值（1.1）是憑經驗抓的寬鬆常數，之後可依實測回饋再調整。
+      const score = Math.round(Math.max(0, Math.min(100, 100 * Math.exp(-avgCost / 1.1))));
+      return { score, avgCost };
+    }
+
+    /* ---------- 範例音檔載入（快取，同一句只抓一次） ---------- */
+
+    const refAudioCache = {};
+    function loadReferenceAudio(seqIndex) {
+      if (refAudioCache[seqIndex]) return refAudioCache[seqIndex];
+      const url = `audio/s${seqIndex}.wav`;
+      const p = fetch(url)
+        .then(res => {
+          if (!res.ok) throw new Error('HTTP ' + res.status);
+          return res.arrayBuffer();
+        })
+        .then(buf => decodeAudioSamples(getAudioCtx(), buf))
+        .catch(err => {
+          delete refAudioCache[seqIndex];
+          console.error('無法載入範例音檔:', url, err);
+          throw err;
+        });
+      refAudioCache[seqIndex] = p;
+      return p;
+    }
+
+    /* ---------- 評估流程 ---------- */
+
+    function evaluateAudio(event, seqIndex, audioBlob) {
       event.stopPropagation();
       const statusDiv = document.getElementById('status-S-' + seqIndex);
       const resultDiv = document.getElementById('result-S-' + seqIndex);
 
       resultDiv.innerHTML = '';
+      statusDiv.innerHTML = '⚙️ 正在比對聲音中…';
 
-      if (!SpeechRecognitionCtor) {
-        statusDiv.innerHTML = '⚠️ 這個瀏覽器不支援語音辨識，請改用電腦版或手機版的 Chrome／Edge。';
-        return;
-      }
-
-      if (!recognizedText) {
-        let hint = '⚠️ 沒有辨識到聲音內容，請重新錄一次，對著麥克風清楚唸出這句。';
-        if (lastRecognitionError === 'not-allowed' || lastRecognitionError === 'service-not-allowed') {
-          hint = '⚠️ 沒有麥克風權限，請允許瀏覽器使用麥克風後重新錄音。';
-        } else if (lastRecognitionError === 'network') {
-          hint = '⚠️ 語音辨識連線失敗（需要連網才能辨識，也可能被瀏覽器擴充功能／防火牆擋住），請確認後重新錄音。';
-        } else if (lastRecognitionError === 'no-speech') {
-          hint = '⚠️ 沒有聽到聲音，請靠近麥克風、聲音再大聲一點，重新錄一次。';
-        } else if (lastRecognitionError) {
-          hint = `⚠️ 辨識失敗（錯誤代碼：${lastRecognitionError}），請重新錄一次。`;
-        }
-        statusDiv.innerHTML = hint;
-        return;
-      }
-
-      statusDiv.innerHTML = '✅ 分析完成';
-      showEvaluationResult(seqIndex, targetText, recognizedText);
+      Promise.all([
+        audioBlob.arrayBuffer().then(buf => decodeAudioSamples(getAudioCtx(), buf)),
+        loadReferenceAudio(seqIndex)
+      ])
+        .then(([rec, ref]) => {
+          const featRecRaw = extractFeatures(rec.samples, rec.sampleRate);
+          const featRefRaw = extractFeatures(ref.samples, ref.sampleRate);
+          const featRec = trimSilence(featRecRaw.rms, featRecRaw.zcr, 0.08);
+          const featRef = trimSilence(featRefRaw.rms, featRefRaw.zcr, 0.08);
+          const { score } = dtwSimilarity(featRec, featRef);
+          statusDiv.innerHTML = '✅ 分析完成';
+          showAudioEvaluationResult(seqIndex, score, featRef.rms, featRec.rms);
+        })
+        .catch(err => {
+          console.error('聲音比對失敗:', err);
+          statusDiv.innerHTML = '⚠️ 沒辦法完成聲音比對，請確認網路連線、或重新錄音後再試一次。';
+        });
     }
 
-    function levenshteinDistance(s1, s2) {
-      const m = s1.length;
-      const n = s2.length;
-      const dp = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
-      for (let i = 0; i <= m; i++) dp[i][0] = i;
-      for (let j = 0; j <= n; j++) dp[0][j] = j;
-
-      for (let i = 1; i <= m; i++) {
-        for (let j = 1; j <= n; j++) {
-          if (s1[i - 1] === s2[j - 1]) {
-            dp[i][j] = dp[i - 1][j - 1];
-          } else {
-            dp[i][j] = Math.min(
-              dp[i - 1][j] + 1,
-              dp[i][j - 1] + 1,
-              dp[i - 1][j - 1] + 1
-            );
-          }
-        }
-      }
-      return dp[m][n];
+    /* 兩條線各自依自己的長度正規化 x 軸（不是照 DTW 路徑對齊），
+       用意是讓使用者一眼看出「節奏快慢、抑揚頓挫」大致像不像，
+       不是精準的逐幀對齊圖。 */
+    function buildContourSvg(refRms, recRms) {
+      const w = 300, h = 60, pad = 2;
+      const toPoints = arr => {
+        const max = Math.max(1e-6, ...arr);
+        return arr.map((v, i) => {
+          const x = arr.length > 1 ? (i / (arr.length - 1)) * (w - pad * 2) + pad : w / 2;
+          const y = h - pad - (v / max) * (h - pad * 2);
+          return `${x.toFixed(1)},${y.toFixed(1)}`;
+        }).join(' ');
+      };
+      return `
+        <svg class="speak-contour" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg">
+          <polyline points="${toPoints(refRms)}" class="contour-ref" fill="none" />
+          <polyline points="${toPoints(recRms)}" class="contour-rec" fill="none" />
+        </svg>
+      `;
     }
 
-    /* 只留漢字（濾掉標點、空白，以及課文裡偶爾夾雜的臺羅註記），
-       辨識結果本來就只會是漢字，兩邊用同一套過濾才比得準。 */
-    function hanziOnly(str) {
-      return Array.from(str || '').filter(c => HANZI.test(c)).join('');
-    }
-
-    function computeSimilarity(recognized, target) {
-      const r = hanziOnly(recognized);
-      const t = hanziOnly(target);
-      if (!r || !t) return 0;
-      const dist = levenshteinDistance(Array.from(r), Array.from(t));
-      const maxLen = Math.max(r.length, t.length);
-      const raw = (1 - dist / maxLen) * 100;
-      // 辨識引擎本身只抓得到「近似音」，原始分數對學生來說太嚴苛，
-      // 把跟 100 分的差距壓縮 25%，放寬整體標準。
-      const eased = raw + (100 - raw) * 0.25;
-      return Math.round(Math.max(0, Math.min(100, eased)));
-    }
-
-    /* 逐字編輯距離對齊＋回溯：回傳跟 target 等長的陣列，
-       每個位置標示該目標字元是 'match'（對上）、'sub'（唸成別的字）或 'del'（漏唸）。
-       辨識結果多唸出來的字（insertion）不影響任何目標字元的標記。 */
-    function alignChars(target, recognized) {
-      const m = target.length;
-      const n = recognized.length;
-      const dp = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
-      for (let i = 0; i <= m; i++) dp[i][0] = i;
-      for (let j = 0; j <= n; j++) dp[0][j] = j;
-
-      for (let i = 1; i <= m; i++) {
-        for (let j = 1; j <= n; j++) {
-          if (target[i - 1] === recognized[j - 1]) {
-            dp[i][j] = dp[i - 1][j - 1];
-          } else {
-            dp[i][j] = Math.min(
-              dp[i - 1][j - 1] + 1,
-              dp[i - 1][j] + 1,
-              dp[i][j - 1] + 1
-            );
-          }
-        }
-      }
-
-      const marks = new Array(m).fill('del');
-      let i = m, j = n;
-      while (i > 0 || j > 0) {
-        if (i > 0 && j > 0 && target[i - 1] === recognized[j - 1] && dp[i][j] === dp[i - 1][j - 1]) {
-          marks[i - 1] = 'match';
-          i--; j--;
-        } else if (i > 0 && j > 0 && dp[i][j] === dp[i - 1][j - 1] + 1) {
-          marks[i - 1] = 'sub';
-          i--; j--;
-        } else if (i > 0 && dp[i][j] === dp[i - 1][j] + 1) {
-          marks[i - 1] = 'del';
-          i--;
-        } else {
-          j--;
-        }
-      }
-      return marks;
-    }
-
-    function buildWordDiffHtml(sentenceEntry, targetText, recognizedText) {
-      const targetClean = hanziOnly(targetText);
-      const recognizedClean = hanziOnly(recognizedText);
-      if (!targetClean) return '';
-
-      let words = (sentenceEntry && sentenceEntry.words && sentenceEntry.words.length)
-        ? sentenceEntry.words.slice()
-        : null;
-      if (words) {
-        const sum = words.reduce((n, w) => n + Array.from(w).length, 0);
-        if (sum !== Array.from(targetClean).length) words = null;   // 對不齊就退回逐字顯示
-      }
-      if (!words) words = Array.from(targetClean);
-
-      const marks = alignChars(Array.from(targetClean), Array.from(recognizedClean));
-
-      let html = '';
-      let pos = 0;
-      words.forEach(word => {
-        const len = Array.from(word).length;
-        const wordMarks = marks.slice(pos, pos + len);
-        pos += len;
-        // 詞內超過一半的字有對上就算過，不用整個詞逐字都對才算對，放寬逐詞標示的標準。
-        const matchedCount = wordMarks.filter(mk => mk === 'match').length;
-        const ok = wordMarks.length > 0 && matchedCount / wordMarks.length >= 0.5;
-        html += `<span class="word-diff ${ok ? 'word-ok' : 'word-bad'}">${escapeHtml(word)}</span>`;
-      });
-      return html;
-    }
-
-    function showEvaluationResult(seqIndex, targetText, recognizedText) {
-      const s = allSentences[seqIndex];
+    function showAudioEvaluationResult(seqIndex, score, refRms, recRms) {
       const resultDiv = document.getElementById('result-S-' + seqIndex);
 
-      // 門檻刻意放寬、用語偏鼓勵：辨識引擎本身只抓得到「近似音」，
-      // 分數太貼近嚴格對錯容易讓學生誤以為自己唸錯了。
-      const score = computeSimilarity(recognizedText, targetText);
       let feedbackText, scoreClass;
       if (score >= 70) {
-        feedbackText = '🌟 太棒了，發音很接近！';
+        feedbackText = '🌟 太棒了，節奏和音量走勢很接近範例！';
         scoreClass = 'score-excellent';
       } else if (score >= 40) {
-        feedbackText = '👍 不錯，再練習幾次會更好！';
+        feedbackText = '👍 有點像了，再多聽幾次範例音、跟著練習！';
         scoreClass = 'score-good';
       } else {
-        feedbackText = '💡 再多聽幾次示範音，跟著慢慢唸！';
+        feedbackText = '💡 落差還蠻大的，建議先聽範例音、跟著慢慢唸！';
         scoreClass = 'score-retry';
       }
 
-      const wordsHtml = buildWordDiffHtml(s, targetText, recognizedText);
+      const chartHtml = buildContourSvg(refRms, recRms);
 
       resultDiv.innerHTML = `
         <div class="speak-eval-card">
@@ -2416,9 +2409,14 @@
             <span class="speak-eval-score ${scoreClass}">${score} 分</span>
             <span class="speak-eval-feedback">${feedbackText}</span>
           </div>
-          <div class="speak-eval-words">${wordsHtml}</div>
-          <div class="speak-eval-details">辨識結果：${escapeHtml(recognizedText) || '(無)'}</div>
-          <div class="speak-accuracy-note">⚠️ 這裡用的是瀏覽器內建語音辨識（辨識成「近似音」的華語字，不是正確台語漢字），逐詞紅綠標示跟分數僅供練習參考，不是正式發音評量。</div>
+          <div class="speak-contour-wrap">
+            ${chartHtml}
+            <div class="speak-contour-legend">
+              <span class="legend-ref">━ 範例音</span>
+              <span class="legend-rec">━ 我的錄音</span>
+            </div>
+          </div>
+          <div class="speak-accuracy-note">⚠️ 這是「聲音節奏／音量走勢」的相似度，不是逐字發音辨識，不代表有沒有唸對每一個字，僅供練習參考，不是正式發音評量。</div>
         </div>
       `;
     }
